@@ -1,0 +1,8 @@
+data/
+output/
+.pixi/
+.Rhistory
+.Rproj.user/.RData
+.RDataTmp
+.RData
+/.Rproj.user/
