@@ -54,153 +54,343 @@ stopifnot(nrow(outcomes) == expected_n)
 # 4. Missingness as signal   -> output/missingness_vs_death.csv
 # ...
 
+# Data wrangling ----
 
+# Combine set-a time-series measurements into one long table
+set_a_long <- d$ts
 
-d$ts
-d$static
+# Check the long table
+head(set_a_long)
+dim(set_a_long)
+length(unique(set_a_long$RecordID))
+unique(set_a_long$Parameter)
 
-unique(d$ts$Parameter)
+# Write giant skinny table
+fwrite(
+  set_a_long,
+  file.path(out_dir, "set-a_long.csv")
+)
 
-summary(d$ts)
+# 开始数据初步处理，先看看数据概括，找到异常值 ----
+measurement_summary <- set_a_long |>
+  group_by(Parameter) |>
+  summarise(
+    n = n(),
+    min = min(Value, na.rm = TRUE),
+    p01 = quantile(Value, 0.01, na.rm = TRUE),
+    median = median(Value, na.rm = TRUE),
+    p99 = quantile(Value, 0.99, na.rm = TRUE),
+    max = max(Value, na.rm = TRUE),
+    .groups = "drop"
+  )
 
-d$ts[, .(
-  Min = min(Value, na.rm = TRUE),
-  Max = max(Value, na.rm = TRUE),
-  Mean = mean(Value, na.rm = TRUE),
-  N = .N
-), by = Parameter]
+print(measurement_summary, n = Inf)
 
-d$ts[Parameter == "Temp" & Value < 30]
-d$ts[Parameter == "pH" & Value > 14]
-
-d$ts[Parameter == "HR" & Value <= 0]
-d$ts[Parameter == "HR" & Value > 250]
-
-d$ts[Parameter == "RespRate" & Value <= 0]
-d$ts[Parameter == "RespRate" & Value > 60]
-
-d$ts[Parameter == "K" & Value > 10]
-d$ts[Parameter == "Glucose" & Value > 1000]
-
-d$ts[Parameter == "Na" & Value <= 0]
-d$ts[Parameter == "Creatinine" & Value <= 0]
-
-d$ts[Parameter == "MechVent", .N, by = Value]
-
-
-d$ts[Parameter == "Temp" & Value < 30, .N]
-d$ts[Parameter == "pH" & Value > 14, .N]
-d$ts[Parameter == "HR" & Value <= 0, .N]
-d$ts[Parameter == "RespRate" & Value <= 0, .N]
-
-
-# 开始cleaning ----
-ts_clean <- copy(d$ts)
-ts_clean[Parameter == "Temp" & Value < 30, Value := NA]
-ts_clean[Parameter == "pH" & Value > 14, Value := NA]
-ts_clean[Parameter == "HR" & Value <= 0, Value := NA]
-ts_clean[Parameter == "RespRate" & Value <= 0, Value := NA]
-
-# ts_clean[Parameter == "Temp" & Value < 30, .N]
-# ts_clean[Parameter == "pH" & Value > 14, .N]
-# ts_clean[Parameter == "HR" & Value <= 0, .N]
-# ts_clean[Parameter == "RespRate" & Value <= 0, .N]
-
-ts_clean[, .(
-  Missing = sum(is.na(Value))
-), by = Parameter]
-nrow(ts_clean)
-
-ts_clean[, .(
-  Missing = sum(is.na(Value)),
-  Total = .N,
-  Missing_pct = 100 * sum(is.na(Value)) / .N
-), by = Parameter]
-
-ts_clean[, .(
-  Missing = sum(is.na(Value)),
-  Total = .N,
-  Missing_pct = 100 * sum(is.na(Value)) / .N
-), by = Parameter][order(-Missing_pct)]
-
-ts_clean[, .N, by = RecordID][, summary(N)]
-
-patient_missing <- ts_clean[, .(
-  Total = .N,
-  Missing = sum(is.na(Value))
-), by = RecordID]
-
-patient_missing[, Missing_pct := 100 * Missing / Total]
-
-summary(patient_missing$Missing_pct)
-
-# 
-presence <- ts_clean[, .(
-  Present = 1L
-), by = .(RecordID, Parameter)]
-
-presence_summary <- presence[, .(
-  Patients_measured = .N,
-  Total_patients = 4000,
-  Missing_patients = 4000 - .N,
-  Missing_pct = 100 * (4000 - .N) / 4000
-), by = Parameter]
-
-presence_summary <- presence_summary[order(-Missing_pct)]
-
-presence_summary
-
-# 
-head(outcomes)
-names(outcomes)
-table(outcomes[["In-hospital_death"]])
-nrow(outcomes)
-str(outcomes)
-
-
-
-
-
-# data wrangling longer ----
-# 1. 将 d$statistic 从宽表变成长表
-d$statistic_long <- d$statistic %>%
-  pivot_longer(
-    cols = -RecordID,          # 除了 RecordID，其他列全部转换
-    names_to = "Parameter",    # 列名（Age, Gender...）变成 Parameter 列的值
-    values_to = "Value"        # 具体的数值变成 Value 列的值
-  ) %>%
+# 第一步：把 Time 转成 ICU hour
+set_a_long <- set_a_long |>
+  separate(
+    Time,
+    into = c("hour", "minute"),
+    sep = ":",
+    remove = FALSE,
+    convert = TRUE
+  ) |>
   mutate(
-    Time = "00:00",            # 静态数据统一标记为 00:00
-    Value = as.numeric(Value)  # 确保数值型统一（避免合并时报错）
-  ) %>%
-  select(RecordID, Time, Parameter, Value) # 调整列顺序，与 d$ts 完全一致
+    ICU_hour = hour + minute / 60,
+    hour_bin = floor(ICU_hour)
+  )
+# 第二步：计算每个小时有多少病人测过某项指标
+missingness_by_hour <- set_a_long |>
+  filter(hour_bin >= 0, hour_bin < 48) |>
+  distinct(RecordID, Parameter, hour_bin) |>
+  count(Parameter, hour_bin, name = "n_measured") |>
+  complete(
+    Parameter,
+    hour_bin = 0:47,
+    fill = list(n_measured = 0)
+  ) |>
+  mutate(
+    proportion_measured = n_measured / expected_n,
+    proportion_missing = 1 - proportion_measured
+  )
+# 第三步：画 temporal missingness heatmap
+ggplot(
+  missingness_by_hour,
+  aes(x = hour_bin, y = Parameter, fill = proportion_missing)
+) +
+  geom_tile() +
+  scale_fill_viridis_c(
+    name = "Missing proportion",
+    limits = c(0, 1)
+  ) +
+  labs(
+    title = "Missingness by Measurement and ICU Hour",
+    x = "ICU Hour",
+    y = "Parameter"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 7)
+  )
 
-# 看一眼转换后的结果
-head(d$statistic_long)
-# 预期输出：
-# # A tibble: 6 × 4
-#   RecordID Time  Parameter Value
-#      <dbl> <chr> <chr>     <dbl>
-# 1   132539 00:00 Age          54
-# 2   132539 00:00 Gender        0
-# 3   132539 00:00 Height       NA
-# 4   132539 00:00 ICUType       4
-# 5   132539 00:00 Weight       NA
-# ...
+# long变wide ----
+# Summarize each measurement over the 48-hour ICU period
+# Build wide table ----
 
-# 2. 将 d$ts 和转换后的 d$statistic_long 合并成巨型长表
-set_a_long <- bind_rows(d$ts, d$statistic_long)
+measurement_summary_wide <- set_a_long |>
+  arrange(RecordID, Parameter, ICU_hour) |>
+  group_by(RecordID, Parameter) |>
+  summarise(
+    count = sum(!is.na(Value)),
+    first = first(Value[!is.na(Value)]),
+    last  = last(Value[!is.na(Value)]),
+    min   = min(Value, na.rm = TRUE),
+    max   = max(Value, na.rm = TRUE),
+    mean  = mean(Value, na.rm = TRUE),
+    .groups = "drop"
+  )
 
-# 3. 排序（可选，但推荐。按患者ID、时间、参数排序）
-set_a_long <- set_a_long %>%
-  arrange(RecordID, Time, Parameter)
+# Convert to one row per admission
+set_a_wide <- measurement_summary_wide |>
+  pivot_wider(
+    names_from = Parameter,
+    values_from = c(count, first, last, min, max, mean),
+    names_glue = "{Parameter}_{.value}"
+  )
 
-# 4. 输出到指定文件
-if (!dir.exists(".output")) {
-  dir.create(".output", recursive = TRUE)
-}
-write_csv(set_a_long, ".output/set-a_long.csv")
+# Add static patient characteristics
+set_a_wide <- d$static |>
+  left_join(set_a_wide, by = "RecordID")
 
-cat("合并完成！总行数：", nrow(set_a_long), "\n")
+# Add outcomes
+set_a_wide <- set_a_wide |>
+  left_join(outcomes, by = "RecordID")
+
+# Save wide table
+fwrite(
+  set_a_wide,
+  file.path(out_dir, "set-a_wide.csv")
+)
+
+# Check
+dim(set_a_wide)
+head(set_a_wide)
+stopifnot(nrow(set_a_wide) == expected_n)
+
+# 画图 ----
+
+# Missingness in wide table ----
+
+wide_missingness <- set_a_wide |>
+  select(ends_with("_mean")) |>
+  summarise(
+    across(
+      everything(),
+      ~ mean(is.na(.x))
+    )
+  ) |>
+  pivot_longer(
+    cols = everything(),
+    names_to = "Variable",
+    values_to = "Missing_proportion"
+  ) |>
+  mutate(
+    Variable = sub("_mean$", "", Variable)
+  ) |>
+  arrange(desc(Missing_proportion))
+
+wide_missingness
+
+ggplot(
+  wide_missingness,
+  aes(
+    x = reorder(Variable, Missing_proportion),
+    y = Missing_proportion
+  )
+) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 1)
+  ) +
+  labs(
+    title = "Missingness of Measurements in Wide Table",
+    x = "Measurement",
+    y = "Missing proportion"
+  ) +
+  theme_minimal()
+
+
+
+# table1.csv ----
+
+# 1. Table 1 ----
+
+table1_continuous <- d$static |>
+  summarise(
+    Age_mean = mean(Age, na.rm = TRUE),
+    Age_sd = sd(Age, na.rm = TRUE),
+    Age_median = median(Age, na.rm = TRUE),
+    
+    Height_mean = mean(Height, na.rm = TRUE),
+    Height_sd = sd(Height, na.rm = TRUE),
+    Height_median = median(Height, na.rm = TRUE),
+    
+    Weight_mean = mean(Weight, na.rm = TRUE),
+    Weight_sd = sd(Weight, na.rm = TRUE),
+    Weight_median = median(Weight, na.rm = TRUE)
+  ) |>
+  pivot_longer(
+    everything(),
+    names_to = "Characteristic",
+    values_to = "Value"
+  )
+
+table1_gender <- d$static |>
+  count(Gender) |>
+  mutate(
+    Characteristic = paste0("Gender_", Gender),
+    Value = n
+  ) |>
+  select(Characteristic, Value)
+
+table1_icu <- d$static |>
+  count(ICUType) |>
+  mutate(
+    Characteristic = paste0("ICUType_", ICUType),
+    Value = n
+  ) |>
+  select(Characteristic, Value)
+
+table1 <- bind_rows(
+  table1_continuous,
+  table1_gender,
+  table1_icu
+)
+
+write.csv(
+  table1,
+  file.path(out_dir, "table1.csv"),
+  row.names = FALSE
+)
+
+
+# outcome.cvs ----
+# 2. Outcome summary
+
+outcome_summary <- outcomes |>
+  summarise(
+    N = n(),
+    
+    Death_n = sum(`In-hospital_death` == 1, na.rm = TRUE),
+    Death_proportion = mean(`In-hospital_death` == 1, na.rm = TRUE),
+    
+    Length_of_stay_mean = mean(Length_of_stay, na.rm = TRUE),
+    Length_of_stay_median = median(Length_of_stay, na.rm = TRUE),
+    
+    SAPS_I_mean = mean(`SAPS-I`, na.rm = TRUE),
+    SAPS_I_median = median(`SAPS-I`, na.rm = TRUE),
+    
+    SOFA_mean = mean(SOFA, na.rm = TRUE),
+    SOFA_median = median(SOFA, na.rm = TRUE)
+  ) |>
+  pivot_longer(
+    everything(),
+    names_to = "Outcome",
+    values_to = "Value"
+  )
+
+write.csv(
+  outcome_summary,
+  file.path(out_dir, "outcomes.csv"),
+  row.names = FALSE
+)
+
+# missingmap.png ----
+# 3. Missingness map 
+
+missingness_plot <- ggplot(
+  missingness_by_hour,
+  aes(
+    x = hour_bin,
+    y = Parameter,
+    fill = proportion_missing
+  )
+) +
+  geom_tile() +
+  scale_fill_viridis_c(
+    name = "Missing proportion",
+    limits = c(0, 1)
+  ) +
+  labs(
+    title = "Missingness by Measurement and ICU Hour",
+    x = "ICU Hour",
+    y = "Parameter"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 7)
+  )
+
+ggsave(
+  filename = file.path(out_dir, "missingness_map.png"),
+  plot = missingness_plot,
+  width = 12,
+  height = 8,
+  dpi = 300
+)
+
+# missingness_vs_death.csv ----
+# 4. Missingness as signal
+# 4. Missingness as signal ----
+
+missingness_vs_death <- set_a_wide |>
+  select(
+    RecordID,
+    `In-hospital_death`,
+    ends_with("_count")
+  ) |>
+  pivot_longer(
+    cols = ends_with("_count"),
+    names_to = "Parameter",
+    values_to = "count"
+  ) |>
+  mutate(
+    Parameter = sub("_count$", "", Parameter),
+    count = replace_na(count, 0),
+    measured = if_else(count > 0, "Measured", "Not measured")
+  ) |>
+  group_by(Parameter, measured) |>
+  summarise(
+    n = n(),
+    deaths = sum(`In-hospital_death` == 1, na.rm = TRUE),
+    death_rate = mean(`In-hospital_death` == 1, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(missingness_vs_death, n = Inf)
+
+write.csv(
+  missingness_vs_death,
+  file.path(out_dir, "missingness_vs_death.csv"),
+  row.names = FALSE
+)
+
+# 简单检查
+# Check required outputs ----
+
+required_outputs <- c(
+  "set-a_long.csv",
+  "set-a_wide.csv",
+  "table1.csv",
+  "outcomes.csv",
+  "missingness_map.png",
+  "missingness_vs_death.csv"
+)
+file.exists(file.path(out_dir, required_outputs))
+
+
+
 
 message("Checkpoint 1 complete. See output/.")
