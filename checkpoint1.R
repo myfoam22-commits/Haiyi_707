@@ -54,7 +54,6 @@ stopifnot(nrow(outcomes) == expected_n)
 # 4. Missingness as signal   -> output/missingness_vs_death.csv
 # ...
 
-# Data wrangling ----
 
 # Combine set-a time-series measurements into one long table
 set_a_long <- d$ts
@@ -86,7 +85,7 @@ measurement_summary <- set_a_long |>
 
 print(measurement_summary, n = Inf)
 
-# 第一步：把 Time 转成 ICU hour
+# 1：把 Time 转成 ICU hour
 set_a_long <- set_a_long |>
   separate(
     Time,
@@ -99,7 +98,7 @@ set_a_long <- set_a_long |>
     ICU_hour = hour + minute / 60,
     hour_bin = floor(ICU_hour)
   )
-# 第二步：计算每个小时有多少病人测过某项指标
+# 2：计算每个小时有多少病人测过某项指标
 missingness_by_hour <- set_a_long |>
   filter(hour_bin >= 0, hour_bin < 48) |>
   distinct(RecordID, Parameter, hour_bin) |>
@@ -113,7 +112,7 @@ missingness_by_hour <- set_a_long |>
     proportion_measured = n_measured / expected_n,
     proportion_missing = 1 - proportion_measured
   )
-# 第三步：画 temporal missingness heatmap
+# 3：temporal missingness heatmap
 ggplot(
   missingness_by_hour,
   aes(x = hour_bin, y = Parameter, fill = proportion_missing)
@@ -133,9 +132,9 @@ ggplot(
     axis.text.y = element_text(size = 7)
   )
 
-# long变wide ----
+# long to wide ----
 # Summarize each measurement over the 48-hour ICU period
-# Build wide table ----
+# Build wide table
 
 measurement_summary_wide <- set_a_long |>
   arrange(RecordID, Parameter, ICU_hour) |>
@@ -176,8 +175,6 @@ fwrite(
 dim(set_a_wide)
 head(set_a_wide)
 stopifnot(nrow(set_a_wide) == expected_n)
-
-# 画图 ----
 
 # Missingness in wide table ----
 
@@ -343,7 +340,6 @@ ggsave(
 
 # missingness_vs_death.csv ----
 # 4. Missingness as signal
-# 4. Missingness as signal ----
 
 missingness_vs_death <- set_a_wide |>
   select(
@@ -377,7 +373,6 @@ write.csv(
   row.names = FALSE
 )
 
-# 简单检查
 # Check required outputs ----
 
 required_outputs <- c(
