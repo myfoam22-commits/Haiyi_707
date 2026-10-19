@@ -3,6 +3,10 @@ output/
 .pixi/
 .Rhistory
 .Rproj.user/.RData
-.RDataTmp
+.RDataTmp*
 .RData
 /.Rproj.user/
+
+.quarto/
+**/*.quarto_ipynb
+
