@@ -1,0 +1,2618 @@
+---
+title: "Checkpoint 2: Building and Comparing ICU Mortality Models"
+author: "Haiyi Xiong"
+format:
+  html:
+    toc: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+## AI-use statement
+
+I used ChatGPT to help draft and debug R code, organize the modeling workflow, and improve the clarity of the written report. I ran the analyses in RStudio and checked the output tables, patient counts, cross-validation assignments, plots, and model predictions against the assignment requirements. AI assistance was useful for troubleshooting, but some generated code needed correction, including missing fold labels in saved prediction files. The limitation of this approach is that AI-generated code can contain errors, so I reviewed and revised the results rather than accepting suggestions without checking. I am responsible for the submitted analysis.
+
+## Research question and approach
+
+Can clinical measurements collected during the first 48 hours of an intensive care unit (ICU) stay predict in-hospital mortality? Using set-a only, I compare ridge-penalized logistic regression, a generalized additive model (GAM), and a random forest against the SAPS-I and SOFA clinical severity scores. Model discrimination is assessed by area under the receiver operating characteristic curve (AUROC), and probability accuracy by the Brier score. All model predictions used for evaluation are out-of-fold (OOF) predictions.
+
+```{r}
+# library
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(knitr)
+```
+
+## 2.1 Modeling table
+
+Each row represents one ICU stay identified by `RecordID`. The outcome is `In-hospital_death`, joined using the `RecordID` in `Outcomes-a.txt`. Patient characteristics are recorded at ICU time 00:00; time-varying predictors summarize observations from hours 0–48 only. The numeric missing-value code −1 is treated as missing, and non-positive height and weight values are excluded as implausible. For repeated clinical observations, I summarize rather than duplicate because repeated measurements describe the trajectory of care.
+
+```{r}
+
+# 2.1 Build the modeling table
+# Uses set-a only
+set.seed(707)
+
+# 1. Define relative paths
+data_dir <- "data"
+out_dir <- "output"
+
+dir.create(out_dir, showWarnings = FALSE)
+
+# 2. Read the ICU records
+files <- list.files(
+  file.path(data_dir, "set-a"),
+  pattern = "\\.txt$",
+  full.names = TRUE
+)
+
+stopifnot(length(files) == 4000)
+
+raw <- rbindlist(lapply(files, function(f) {
+  x <- fread(f)
+  
+  stopifnot(
+    all(c("Time", "Parameter", "Value") %in% names(x))
+  )
+  
+  x[, RecordID := as.integer(
+    tools::file_path_sans_ext(basename(f))
+  )]
+  
+  x
+}), fill = TRUE)
+
+# 3. Convert measurement values to numeric
+raw[, Value := as.numeric(Value)]
+
+# Treat -1 as missing
+raw[Value == -1, Value := NA_real_]
+
+# 4. Convert time into ICU hours
+time_parts <- tstrsplit(raw$Time, ":", fixed = TRUE)
+
+raw[, ICU_hour :=
+      as.numeric(time_parts[[1]]) +
+      as.numeric(time_parts[[2]]) / 60]
+
+# Restrict measurements to hours 0–48
+raw <- raw[
+  !is.na(ICU_hour) &
+    ICU_hour >= 0 &
+    ICU_hour <= 48
+]
+
+# 5. Extract static patient characteristics
+static_vars <- c(
+  "Age", "Gender", "Height", "ICUType", "Weight"
+)
+
+static <- raw[
+  Time == "00:00" & Parameter %chin% static_vars,
+  .(Value = Value[1]),
+  by = .(RecordID, Parameter)
+]
+
+static <- dcast(
+  static,
+  RecordID ~ Parameter,
+  value.var = "Value"
+)
+
+# Height and weight cannot be zero
+static[!is.na(Height) & Height <= 0,
+       Height := NA_real_]
+
+static[!is.na(Weight) & Weight <= 0,
+       Weight := NA_real_]
+
+# 6. Extract time-varying measurements
+measurements <- raw[
+  !Parameter %chin% c(static_vars, "RecordID") &
+    !is.na(Value)
+]
+
+setorder(
+  measurements,
+  RecordID,
+  Parameter,
+  ICU_hour
+)
+
+# 7. Summarize each measurement
+summaries <- measurements[
+  ,
+  .(
+    count = .N,
+    first = Value[1],
+    last = Value[.N],
+    min = min(Value),
+    max = max(Value),
+    mean = mean(Value)
+  ),
+  by = .(RecordID, Parameter)
+]
+
+# 8. Convert long data to wide data
+wide <- as_tibble(summaries) |>
+  pivot_wider(
+    id_cols = RecordID,
+    names_from = Parameter,
+    values_from = c(
+      count, first, last, min, max, mean
+    ),
+    names_glue = "{Parameter}_{.value}"
+  )
+
+# 9. Replace missing measurement counts with zero
+count_cols <- grep(
+  "_count$",
+  names(wide),
+  value = TRUE
+)
+
+wide <- wide |>
+  mutate(
+    across(
+      all_of(count_cols),
+      ~ replace_na(.x, 0L)
+    )
+  )
+
+# 10. Read outcome data
+outcomes <- fread(
+  file.path(data_dir, "Outcomes-a.txt")
+)
+
+stopifnot(
+  nrow(outcomes) == 4000,
+  anyDuplicated(outcomes$RecordID) == 0
+)
+
+# 11. Join predictors and outcomes
+model_table <- as_tibble(static) |>
+  left_join(wide, by = "RecordID") |>
+  left_join(
+    as_tibble(outcomes) |>
+      select(
+        RecordID,
+        `In-hospital_death`,
+        `SAPS-I`,
+        SOFA
+      ),
+    by = "RecordID"
+  ) |>
+  rename(
+    death = `In-hospital_death`
+  ) |>
+  mutate(
+    death = as.integer(death),
+    Gender = factor(Gender),
+    ICUType = factor(ICUType)
+  )
+
+# 11-2
+
+# Fix missing measurement counts after joining
+
+model_table <- model_table |>
+  mutate(
+    across(
+      ends_with("_count"),
+      ~ tidyr::replace_na(.x, 0L)
+    )
+  )
+
+# Verify that measurement counts contain no NA
+stopifnot(
+  sum(is.na(
+    model_table |> select(ends_with("_count"))
+  )) == 0
+)
+
+# 12. Keep benchmark scores separately
+benchmarks <- model_table |>
+  select(
+    RecordID,
+    death,
+    `SAPS-I`,
+    SOFA
+  )
+
+# SAPS-I and SOFA are not predictors
+model_table <- model_table |>
+  select(
+    -`SAPS-I`,
+    -SOFA
+  )
+
+# 13. Validate the dataset
+stopifnot(
+  nrow(model_table) == 4000,
+  anyDuplicated(model_table$RecordID) == 0,
+  !anyNA(model_table$death),
+  all(model_table$death %in% c(0, 1))
+)
+
+# 14. Save intermediate datasets
+write.csv(
+  model_table,
+  file.path(out_dir, "cp2_modeling_table.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  benchmarks,
+  file.path(out_dir, "cp2_benchmarks.csv"),
+  row.names = FALSE
+)
+
+# 15. Summary table for the report
+model_summary <- data.frame(
+  ICU_stays = nrow(model_table),
+  Deaths = sum(model_table$death == 1),
+  Mortality_percent = round(
+    100 * mean(model_table$death == 1), 2
+  ),
+  Predictor_columns = ncol(model_table) - 2
+)
+
+knitr::kable(
+  model_summary,
+  caption = "Summary of the modeling dataset"
+)
+
+cat(
+  "Unique RecordIDs:",
+  dplyr::n_distinct(model_table$RecordID),
+  "\n"
+)
+
+cat(
+  "Missing outcomes:",
+  sum(is.na(model_table$death)),
+  "\n"
+)
+```
+
+The dataset contains `r nrow(model_table)` unique ICU stays, with `r sum(model_table$death == 1)` deaths (`r sprintf("%.2f", 100 * mean(model_table$death == 1))`%). A one-row-per-stay layout avoids multiple predictions for the same stay and supports direct comparison with SAPS-I and SOFA. The table below is derived exclusively from set-a, and no set-b or set-c files are read.
+
+## 2.2 Predictors
+
+I retain baseline age, gender, height, weight and ICU type; for each dynamic measurement I derive first, last, minimum, maximum, mean and measurement count. These summaries capture initial and recent physiology, extremes, typical levels and monitoring intensity. A measurement count of zero indicates that a measurement was never validly recorded in the observation window. `RecordID` identifies stays but is not a predictor. `Length_of_stay`, `Survival`, SAPS-I and SOFA are not used as features in the three machine learning models.
+
+I prespecified a 98% predictor-missingness exclusion threshold to avoid training on almost entirely unobserved features. The threshold is evaluated within each training split, not using held-out samples; other missing values are handled by training-fold imputation.
+
+```{r}
+
+# 2.2 Predictor groups
+
+baseline_vars <- c(
+  "Age", "Gender", "Height", "Weight", "ICUType"
+)
+
+predictor_names <- setdiff(
+  names(model_table),
+  c("RecordID", "death")
+)
+
+predictor_dictionary <- tibble(
+  Predictor = predictor_names
+) |>
+  mutate(
+    Group = case_when(
+      Predictor %in% baseline_vars ~ "Baseline",
+      grepl("_first$", Predictor) ~ "First value",
+      grepl("_last$", Predictor) ~ "Last value",
+      grepl("_min$", Predictor) ~ "Minimum",
+      grepl("_max$", Predictor) ~ "Maximum",
+      grepl("_mean$", Predictor) ~ "Mean",
+      grepl("_count$", Predictor) ~ "Measurement count",
+      TRUE ~ "Other"
+    ),
+    Clinical_reason = case_when(
+      Group == "Baseline" ~
+        "Baseline patient risk and ICU admission context",
+      Group == "First value" ~
+        "Initial physiological condition",
+      Group == "Last value" ~
+        "Most recent physiological condition",
+      Group == "Minimum" ~
+        "Potentially important low measurements",
+      Group == "Maximum" ~
+        "Potentially important high measurements",
+      Group == "Mean" ~
+        "Average physiological condition",
+      Group == "Measurement count" ~
+        "Monitoring frequency and missingness information",
+      TRUE ~ "Other clinical information"
+    )
+  )
+
+predictor_summary <- predictor_dictionary |>
+  count(
+    Group,
+    Clinical_reason,
+    name = "Number_of_predictors"
+  )
+
+knitr::kable(
+  predictor_summary,
+  caption = "Predictor groups and clinical rationale"
+)
+
+stopifnot(
+  nrow(predictor_dictionary) == 221,
+  !any(c(
+    "Length_of_stay", "Survival",
+    "SAPS-I", "SOFA", "In-hospital_death"
+  ) %in% predictor_names)
+)
+
+
+# Missingness among measurement variables
+
+missingness_summary <- model_table |>
+  summarise(
+    across(
+      ends_with("_count"),
+      ~ round(100 * mean(.x == 0), 1)
+    )
+  ) |>
+  pivot_longer(
+    cols = everything(),
+    names_to = "Measurement",
+    values_to = "Never_measured_percent"
+  ) |>
+  mutate(
+    Measurement = sub(
+      "_count$", "", Measurement
+    )
+  ) |>
+  arrange(desc(Never_measured_percent))
+
+# Display the 10 most frequently unmeasured variables
+knitr::kable(
+  head(missingness_summary, 10),
+  caption = "Ten most frequently unmeasured variables"
+)
+
+
+```
+
+The feature-group table lists `r length(predictor_names)` candidate predictors. The missingness table measures the fraction of stays with no valid observation for each parameter, not the proportion of missing hourly readings. For example, TroponinI is unmeasured in approximately `r missingness_summary$Never_measured_percent[missingness_summary$Measurement == "TroponinI"]`% of stays. A zero measurement count retains this clinically relevant pattern. No variables are dropped using outcome information.
+
+## 2.3 Cross-validation design
+
+I use stratified five-fold cross-validation (CV), with mortality as the stratification variable and the ICU stay as the splitting unit. There is only one row per stay, so `RecordID` cannot appear simultaneously in training and validation. Exactly the same outer folds are used for all three fitted models and both clinical benchmarks. Predictor filtering, imputation, encoding and scaling are fitted only on training data, then applied to held-out data.
+
+```{r}
+
+# 2.3 Stratified 5-fold cross-validation
+library(rsample)
+library(recipes)
+library(dplyr)
+library(knitr)
+
+set.seed(707)
+
+# Convert outcome to a two-level factor
+# This makes stratification explicit
+cv_data <- model_table |>
+  mutate(
+    death = factor(
+      death,
+      levels = c(0, 1),
+      labels = c("Survived", "Died")
+    )
+  )
+
+# Each RecordID must represent exactly one stay
+stopifnot(
+  anyDuplicated(cv_data$RecordID) == 0
+)
+
+# Create five stratified folds
+cv_folds <- vfold_cv(
+  cv_data,
+  v = 5,
+  strata = death
+)
+
+# Save the folds for all three models
+saveRDS(
+  cv_folds,
+  "output/cp2_folds.rds"
+)
+
+# Examine the balance of each fold
+fold_summary <- bind_rows(
+  lapply(seq_len(nrow(cv_folds)), function(i) {
+    
+    split_i <- cv_folds$splits[[i]]
+    
+    train_i <- rsample::analysis(split_i)
+    valid_i <- rsample::assessment(split_i)
+    
+    tibble(
+      Fold = cv_folds$id[[i]],
+      Training_stays = nrow(train_i),
+      Validation_stays = nrow(valid_i),
+      Training_deaths = sum(train_i$death == "Died"),
+      Validation_deaths = sum(valid_i$death == "Died"),
+      Validation_death_pct = round(
+        100 * mean(valid_i$death == "Died"), 2
+      ),
+      Overlapping_IDs = length(
+        intersect(
+          train_i$RecordID,
+          valid_i$RecordID
+        )
+      )
+    )
+  })
+)
+
+knitr::kable(
+  fold_summary,
+  caption = "Stratified five-fold cross-validation design"
+)
+
+# Validation checks
+stopifnot(
+  nrow(fold_summary) == 5,
+  all(fold_summary$Overlapping_IDs == 0),
+  sum(fold_summary$Validation_stays) == 4000,
+  sum(fold_summary$Validation_deaths) == 554
+)
+
+# Every patient must appear in validation exactly once
+validation_ids <- unlist(
+  lapply(cv_folds$splits, function(s) {
+    rsample::assessment(s)$RecordID
+  }),
+  use.names = FALSE
+)
+
+stopifnot(
+  anyDuplicated(validation_ids) == 0,
+  setequal(validation_ids, cv_data$RecordID)
+)
+
+```
+
+The five held-out folds each contain approximately 800 stays and 110–111 deaths, with no overlap of `RecordID` between the analysis and assessment portions of a split. Using the saved fold object for every method rules out fold differences as an explanation for model-performance differences.
+
+### Training-fold predictor exclusion audit
+
+The following audit lists candidate predictors meeting the prespecified 98% missingness threshold in any *training* portion of the five outer folds. Actual preprocessing is still performed by the `recipes` workflow inside every training fold (and separately within inner folds for tuned models).
+
+```{r}
+missingness_drop_audit <- bind_rows(lapply(seq_len(nrow(cv_folds)), function(i) {
+  train <- rsample::analysis(cv_folds$splits[[i]])
+  pred_names <- setdiff(names(train), c("RecordID", "death"))
+  missing_rate <- vapply(train[pred_names], function(x) mean(is.na(x)), numeric(1))
+  keep_names <- names(missing_rate)[missing_rate >= 0.98]
+  tibble(Fold = cv_folds$id[[i]], Predictor = keep_names,
+         Training_missing_percent = round(100 * missing_rate[keep_names], 2))
+}))
+if (nrow(missingness_drop_audit) == 0L) {
+  knitr::kable(data.frame(Result = "None of the raw candidate predictors reached the 98% missingness threshold in outer training folds"),
+               caption = "Training-fold missingness screening")
+} else {
+  knitr::kable(missingness_drop_audit,
+               caption = "Candidate predictors meeting the missingness exclusion threshold")
+}
+```
+
+### Preprocessing check on Fold 1
+
+```{r}
+
+# Test preprocessing using Fold 1 only
+
+train_fold1 <- rsample::analysis(
+  cv_folds$splits[[1]]
+)
+
+valid_fold1 <- rsample::assessment(
+  cv_folds$splits[[1]]
+)
+
+# Specify preprocessing steps
+recipe_logistic <- recipe(
+  death ~ .,
+  data = train_fold1
+) |>
+  update_role(
+    RecordID,
+    new_role = "ID"
+  ) |>
+  step_filter_missing(
+    all_predictors(),
+    threshold = 0.98
+  ) |>
+  step_impute_median(
+    all_numeric_predictors()
+  ) |>
+  step_impute_mode(
+    all_nominal_predictors()
+  ) |>
+  step_dummy(
+    all_nominal_predictors()
+  ) |>
+  step_zv(
+    all_predictors()
+  ) |>
+  step_normalize(
+    all_numeric_predictors()
+  )
+
+# Learn preprocessing parameters using training data only
+trained_recipe <- prep(
+  recipe_logistic,
+  training = train_fold1
+)
+
+# Apply the same preprocessing to both datasets
+train_processed <- bake(
+  trained_recipe,
+  new_data = train_fold1
+)
+
+valid_processed <- bake(
+  trained_recipe,
+  new_data = valid_fold1
+)
+
+# Check validation predictors
+valid_predictors <- valid_processed |>
+  select(
+    -any_of(c("RecordID", "death"))
+  )
+
+preprocessing_check <- data.frame(
+  Training_rows = nrow(train_processed),
+  Validation_rows = nrow(valid_processed),
+  Processed_predictors = ncol(valid_predictors),
+  Missing_predictor_values = sum(
+    is.na(valid_predictors)
+  )
+)
+
+knitr::kable(
+  preprocessing_check,
+  caption = "Preprocessing validation for Fold 1"
+)
+
+stopifnot(
+  sum(is.na(valid_predictors)) == 0
+)
+
+```
+
+## 2.4 Model 1: ridge logistic regression
+
+Ridge (L2) penalization was selected because many first/last/minimum/maximum/mean summaries of the same clinical measure are strongly correlated. Ridge shrinks the coefficients without automatically discarding correlated predictors. Each outer training fold contains a separate stratified three-fold tuning procedure to select the penalty by log loss; external folds are used only to estimate performance. Numerical predictors are normalized before fitting so coefficient magnitudes are on a common scale.
+
+```{r}
+
+# 2.4A Ridge logistic regression with nested CV
+
+library(tidymodels)
+library(glmnet)
+
+# Candidate regularization strengths
+penalty_grid <- tibble(
+  penalty = 10^seq(-4, 1, length.out = 12)
+)
+
+# Ridge logistic regression specification
+ridge_spec <- logistic_reg(
+  penalty = tune(),
+  mixture = 0
+) |>
+  set_engine("glmnet", standardize = FALSE) |>
+  set_mode("classification")
+
+# Store out-of-fold predictions
+ridge_results <- vector(
+  "list",
+  length = nrow(cv_folds)
+)
+
+# Outer cross-validation loop
+for (i in seq_len(nrow(cv_folds))) {
+  
+  cat("Fitting outer fold", i, "of 5\n")
+  
+  outer_split <- cv_folds$splits[[i]]
+  
+  outer_train <- rsample::analysis(outer_split)
+  outer_valid <- rsample::assessment(outer_split)
+  
+  # Inner CV uses only the outer training set
+  set.seed(707 + i)
+  
+  inner_folds <- rsample::vfold_cv(
+    outer_train,
+    v = 3,
+    strata = death
+  )
+  
+  # Define preprocessing
+  # Each inner training fold fits its own recipe
+  ridge_recipe <- recipe(
+    death ~ .,
+    data = outer_train
+  ) |>
+    update_role(
+      RecordID,
+      new_role = "ID"
+    ) |>
+    step_filter_missing(
+      all_predictors(),
+      threshold = 0.98
+    ) |>
+    step_impute_median(
+      all_numeric_predictors()
+    ) |>
+    step_impute_mode(
+      all_nominal_predictors()
+    ) |>
+    step_dummy(
+      all_nominal_predictors()
+    ) |>
+    step_zv(
+      all_predictors()
+    ) |>
+    step_normalize(
+      all_numeric_predictors()
+    )
+  
+  # Combine model and preprocessing
+  ridge_workflow <- workflow() |>
+    add_recipe(ridge_recipe) |>
+    add_model(ridge_spec)
+  
+  # Tune penalty using inner CV
+  tuned <- tune_grid(
+    ridge_workflow,
+    resamples = inner_folds,
+    grid = penalty_grid,
+    metrics = metric_set(mn_log_loss),
+    control = control_grid(
+      save_pred = FALSE
+    )
+  )
+  
+  # Select penalty with lowest log loss
+  best_penalty <- select_best(
+    tuned,
+    metric = "mn_log_loss"
+  )
+  
+  # Fit on the complete outer training set
+  final_workflow <- finalize_workflow(
+    ridge_workflow,
+    best_penalty
+  )
+  
+  outer_fit <- fit(
+    final_workflow,
+    data = outer_train
+  )
+  
+  # Predict death probability in held-out fold
+  predicted_prob <- predict(
+    outer_fit,
+    new_data = outer_valid,
+    type = "prob"
+  )
+  
+  ridge_results[[i]] <- tibble(
+    RecordID = outer_valid$RecordID,
+    Fold = cv_folds$id[[i]],
+    truth = outer_valid$death,
+    p_death = predicted_prob$.pred_Died,
+    penalty = best_penalty$penalty
+  )
+}
+
+# Combine predictions from all five folds
+ridge_oof <- bind_rows(ridge_results)
+
+# Every stay should have one out-of-fold prediction
+stopifnot(
+  nrow(ridge_oof) == 4000,
+  anyDuplicated(ridge_oof$RecordID) == 0,
+  !anyNA(ridge_oof$p_death),
+  all(ridge_oof$p_death >= 0),
+  all(ridge_oof$p_death <= 1)
+)
+
+# Calculate AUROC for each fold
+ridge_fold_auc <- ridge_oof |>
+  group_by(Fold) |>
+  summarise(
+    N = n(),
+    Deaths = sum(truth == "Died"),
+    Best_penalty = first(penalty),
+    AUROC = yardstick::roc_auc_vec(
+      truth = truth,
+      estimate = p_death,
+      event_level = "second"
+    ),
+    Brier_score = mean(
+      (p_death - as.integer(truth == "Died"))^2
+    ),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  ridge_fold_auc,
+  digits = 4,
+  caption = "Ridge logistic regression performance by fold"
+)
+
+# Summarize cross-validation performance
+ridge_cv_summary <- ridge_fold_auc |>
+  summarise(
+    Mean_AUROC = mean(AUROC),
+    SD_AUROC = sd(AUROC),
+    Mean_Brier = mean(Brier_score)
+  )
+
+knitr::kable(
+  ridge_cv_summary,
+  digits = 4,
+  caption = "Ridge logistic regression CV summary"
+)
+
+# Save out-of-fold predictions
+write.csv(
+  ridge_oof |>
+    mutate(
+      death = as.integer(truth == "Died")
+    ) |>
+    select(
+      RecordID,
+      Fold,
+      death,
+      p_death,
+      penalty
+    ),
+  "output/cp2_model1_ridge_oof.csv",
+  row.names = FALSE
+)
+
+cat("Model 1 nested CV complete.\n")
+
+```
+
+Ridge achieves a mean outer-fold AUROC of `r sprintf("%.4f", ridge_cv_summary$Mean_AUROC)` (SD `r sprintf("%.4f", ridge_cv_summary$SD_AUROC)`) and a mean Brier score of `r sprintf("%.4f", ridge_cv_summary$Mean_Brier)`. The fold-specific selected penalties show how regularization depends on the training sample. These estimates come from patients not used in the corresponding outer-fold model fitting.
+
+### Refit ridge on all set-a stays and inspect coefficients
+
+#### Final ridge tuning and refitting
+
+```{r}
+
+# 2.4B Refit Ridge on all set-a data
+
+set.seed(1707)
+
+# Define preprocessing for the full dataset
+full_ridge_recipe <- recipe(
+  death ~ .,
+  data = cv_data
+) |>
+  update_role(
+    RecordID,
+    new_role = "ID"
+  ) |>
+  step_filter_missing(
+    all_predictors(),
+    threshold = 0.98
+  ) |>
+  step_impute_median(
+    all_numeric_predictors()
+  ) |>
+  step_impute_mode(
+    all_nominal_predictors()
+  ) |>
+  step_dummy(
+    all_nominal_predictors()
+  ) |>
+  step_zv(
+    all_predictors()
+  ) |>
+  step_normalize(
+    all_numeric_predictors()
+  )
+
+# Model + recipe
+full_ridge_workflow <- workflow() |>
+  add_recipe(full_ridge_recipe) |>
+  add_model(ridge_spec)
+
+# Tune on all set-a using CV
+# This is for final refitting, not for reporting new test performance
+full_ridge_tuning <- tune_grid(
+  full_ridge_workflow,
+  resamples = cv_folds,
+  grid = penalty_grid,
+  metrics = metric_set(mn_log_loss),
+  control = control_grid(
+    save_pred = FALSE
+  )
+)
+
+# Choose the best penalty
+full_best_penalty <- select_best(
+  full_ridge_tuning,
+  metric = "mn_log_loss"
+)
+
+# Show best candidates
+tuning_table <- collect_metrics(
+  full_ridge_tuning
+) |>
+  filter(.metric == "mn_log_loss") |>
+  arrange(mean) |>
+  select(penalty, mean, std_err) |>
+  head(5)
+
+knitr::kable(
+  tuning_table,
+  digits = 5,
+  caption = "Best Ridge penalty candidates"
+)
+
+# Finalize and fit on all 4000 stays
+ridge_final_workflow <- finalize_workflow(
+  full_ridge_workflow,
+  full_best_penalty
+)
+
+ridge_full_fit <- fit(
+  ridge_final_workflow,
+  data = cv_data
+)
+
+# Save fitted workflow including preprocessing
+saveRDS(
+  ridge_full_fit,
+  "output/cp2_model1_ridge.rds"
+)
+
+cat(
+  "Final Ridge penalty:",
+  full_best_penalty$penalty,
+  "\n"
+)
+
+```
+
+#### Standardized ridge coefficients
+
+```{r}
+
+# Extract Ridge coefficients at the selected penalty
+
+ridge_coefficients <- ridge_full_fit |>
+  workflows::extract_fit_parsnip() |>
+  broom::tidy() |>
+  filter(term != "(Intercept)") |>
+  mutate(
+    Absolute_coefficient = abs(estimate),
+    Direction = if_else(
+      estimate > 0,
+      "Positive",
+      "Negative"
+    )
+  ) |>
+  arrange(desc(Absolute_coefficient))
+
+# Save all coefficients
+write.csv(
+  ridge_coefficients,
+  "output/cp2_model1_ridge_coefficients.csv",
+  row.names = FALSE
+)
+
+# Display the 20 largest absolute coefficients
+top20_coefficients <- ridge_coefficients |>
+  slice_head(n = 20)
+
+knitr::kable(
+  top20_coefficients,
+  digits = 4,
+  caption = "Twenty largest standardized Ridge coefficients"
+)
+
+```
+
+#### Ridge coefficient plot
+
+```{r}
+
+# Plot the 25 largest standardized coefficients
+
+top25_coefficients <- ridge_coefficients |>
+  slice_head(n = 25) |>
+  mutate(
+    term = reorder(term, estimate)
+  )
+
+ridge_coef_plot <- ggplot(
+  top25_coefficients,
+  aes(
+    x = term,
+    y = estimate,
+    fill = Direction
+  )
+) +
+  geom_col() +
+  coord_flip() +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    color = "gray50"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Positive" = "#C44E52",
+      "Negative" = "#4C72B0"
+    )
+  ) +
+  labs(
+    title = "Largest Standardized Ridge Coefficients",
+    subtitle = "Model refitted on all set-a ICU stays",
+    x = "Predictor",
+    y = "Standardized coefficient",
+    fill = "Direction"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(ridge_coef_plot)
+
+ggsave(
+  filename = "output/cp2_ridge_coefficients_top25.png",
+  plot = ridge_coef_plot,
+  width = 10,
+  height = 8,
+  dpi = 300
+)
+
+```
+
+**Figure interpretation.** The largest standardized ridge associations include lower fitted mortality log odds for higher last Glasgow Coma Scale (GCS) readings, and higher log odds for older age, elevated last blood urea nitrogen (BUN) and elevated last glucose. Multiple GCS and BUN summaries are correlated; individual coefficient signs and sizes are not independent causal effects. The coefficients are shown on a common standardized scale.
+
+## 2.5 Model 2: generalized additive model
+
+The logistic GAM uses 15 clinically interpretable predictors describing age, neurological status, kidney function, glucose, circulation, temperature, body size and measurement intensity. Smooth terms are fitted for age, last blood urea nitrogen (BUN), last glucose, maximum heart rate and mean temperature; remaining predictors are linear or categorical. Each spline has a fixed basis dimension of four, and the smoothing parameters are estimated using restricted maximum likelihood (REML) within training data. Since the GAM feature set was informed by model exploration on set-a, its cross-validation performance should be regarded as an internal, potentially somewhat optimistic comparison rather than an independent validation.
+
+```{r}
+
+# 2.5A GAM cross-validation
+
+library(mgcv)
+library(recipes)
+library(dplyr)
+library(yardstick)
+
+# Select predictors based on clinical relevance
+# and the Ridge model results
+
+gam_smooth <- c(
+  "Age",
+  "BUN_last",
+  "Glucose_last",
+  "HR_max",
+  "Temp_mean"
+)
+
+gam_linear <- c(
+  "GCS_last",
+  "Weight",
+  "RespRate_count",
+  "Urine_count",
+  "GCS_count",
+  "Na_first",
+  "SysABP_min",
+  "WBC_mean",
+  "ICUType",
+  "Gender"
+)
+
+gam_predictors <- c(
+  gam_smooth,
+  gam_linear
+)
+
+stopifnot(
+  length(gam_predictors) == 15,
+  all(gam_predictors %in% names(cv_data))
+)
+
+# Construct GAM formula
+smooth_terms <- paste0(
+  "s(", gam_smooth, ", bs = 'cr', k = 4)"
+)
+
+gam_formula <- reformulate(
+  c(smooth_terms, gam_linear),
+  response = "death"
+)
+
+print(gam_formula)
+
+# Keep identical predictor processing in each fold
+prepare_gam_data <- function(dat) {
+  dat |>
+    dplyr::select(
+      RecordID,
+      death,
+      dplyr::all_of(gam_predictors)
+    ) |>
+    dplyr::mutate(
+      dplyr::across(
+        dplyr::ends_with("_count"),
+        log1p
+      )
+    )
+}
+
+# Store out-of-fold predictions
+gam_results <- vector(
+  "list",
+  length = nrow(cv_folds)
+)
+
+for (i in seq_len(nrow(cv_folds))) {
+  
+  cat("Fitting GAM fold", i, "of 5\n")
+  
+  split_i <- cv_folds$splits[[i]]
+  
+  train_i <- prepare_gam_data(
+    rsample::analysis(split_i)
+  )
+  
+  valid_i <- prepare_gam_data(
+    rsample::assessment(split_i)
+  )
+  
+  # Imputation is learned from training data only
+  gam_recipe <- recipe(
+    death ~ .,
+    data = train_i
+  ) |>
+    update_role(
+      RecordID,
+      new_role = "ID"
+    ) |>
+    step_impute_median(
+      all_numeric_predictors()
+    ) |>
+    step_impute_mode(
+      all_nominal_predictors()
+    )
+  
+  gam_prep <- prep(
+    gam_recipe,
+    training = train_i
+  )
+  
+  train_ready <- bake(
+    gam_prep,
+    new_data = train_i
+  )
+  
+  valid_ready <- bake(
+    gam_prep,
+    new_data = valid_i
+  )
+  
+  # Fit GAM; smoothing parameters estimated by REML
+  gam_fit <- mgcv::gam(
+    formula = gam_formula,
+    data = train_ready,
+    family = binomial(link = "logit"),
+    method = "REML"
+  )
+  
+  # Predict held-out mortality probabilities
+  p_death <- as.numeric(
+    predict(
+      gam_fit,
+      newdata = valid_ready,
+      type = "response"
+    )
+  )
+  
+  gam_results[[i]] <- tibble(
+    RecordID = valid_i$RecordID,
+    Fold = cv_folds$id[[i]],
+    truth = valid_i$death,
+    p_death = p_death
+  )
+}
+
+# Combine all held-out predictions
+gam_oof <- bind_rows(gam_results)
+
+stopifnot(
+  nrow(gam_oof) == 4000,
+  anyDuplicated(gam_oof$RecordID) == 0,
+  all(is.finite(gam_oof$p_death)),
+  all(gam_oof$p_death >= 0),
+  all(gam_oof$p_death <= 1)
+)
+
+# Evaluate each fold
+gam_fold_auc <- gam_oof |>
+  group_by(Fold) |>
+  summarise(
+    N = n(),
+    Deaths = sum(truth == "Died"),
+    AUROC = yardstick::roc_auc_vec(
+      truth = truth,
+      estimate = p_death,
+      event_level = "second"
+    ),
+    Brier_score = mean(
+      (p_death - as.integer(truth == "Died"))^2
+    ),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  gam_fold_auc,
+  digits = 4,
+  caption = "GAM performance by fold"
+)
+
+gam_cv_summary <- gam_fold_auc |>
+  summarise(
+    Mean_AUROC = mean(AUROC),
+    SD_AUROC = sd(AUROC),
+    Mean_Brier = mean(Brier_score)
+  )
+
+knitr::kable(
+  gam_cv_summary,
+  digits = 4,
+  caption = "GAM cross-validation summary"
+)
+
+# Save predictions for later model comparison
+write.csv(
+  gam_oof |>
+    mutate(
+      death = as.integer(truth == "Died")
+    ) |>
+    select(
+      RecordID,
+      Fold,
+      death,
+      p_death
+    ),
+  "output/cp2_model2_gam_oof.csv",
+  row.names = FALSE
+)
+
+```
+
+GAM achieves a mean outer-fold AUROC of `r sprintf("%.4f", gam_cv_summary$Mean_AUROC)` (SD `r sprintf("%.4f", gam_cv_summary$SD_AUROC)`) and a mean Brier score of `r sprintf("%.4f", gam_cv_summary$Mean_Brier)`. These results are close to those for ridge, so the flexible smooths have not produced a clear discrimination advantage.
+
+### Refit GAM on complete set-a
+
+```{r}
+# ============================================================
+# STEP 2.5B — Fit final GAM using all set-a records
+# ============================================================
+
+library(dplyr)
+library(recipes)
+library(mgcv)
+library(ggplot2)
+library(tibble)
+library(knitr)
+
+dir.create("output", showWarnings = FALSE)
+
+# Prepare complete modeling data
+gam_full_data <- prepare_gam_data(cv_data)
+
+# Define preprocessing recipe
+gam_full_recipe <- recipe(
+  death ~ .,
+  data = gam_full_data
+) |>
+  update_role(RecordID, new_role = "ID") |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_impute_mode(all_nominal_predictors())
+
+# Fit preprocessing on all set-a records
+gam_full_prep <- prep(
+  gam_full_recipe,
+  training = gam_full_data
+)
+
+gam_full_ready <- bake(
+  gam_full_prep,
+  new_data = gam_full_data
+)
+
+# Fit final GAM
+gam_full_fit <- mgcv::gam(
+  formula = gam_formula,
+  data = gam_full_ready,
+  family = binomial(link = "logit"),
+  method = "REML"
+)
+
+# Inspect model
+summary(gam_full_fit)
+```
+
+### GAM smooth-term summary
+
+```{r}
+gam_smooth_table <- as.data.frame(
+  summary(gam_full_fit)$s.table
+) |>
+  tibble::rownames_to_column("Term")
+
+knitr::kable(
+  gam_smooth_table,
+  digits = 3,
+  caption = "Smooth terms in the final GAM"
+)
+```
+
+Effective degrees of freedom (edf) near 1 indicate approximately linear fitted terms on the log-odds scale; an edf substantially above 1 indicates a more curved fitted shape. The smooth-term p-values test association, **not nonlinearity specifically**. Here age and last glucose are near-linear, while BUN, maximum heart rate and temperature have more visibly nonlinear shapes.
+
+```{r}
+saveRDS(
+  list(
+    model = gam_full_fit,
+    preprocessing = gam_full_prep,
+    predictors = gam_predictors,
+    count_transform = "log1p"
+  ),
+  file = "output/cp2_model2_gam.rds"
+)
+
+file.exists("output/cp2_model2_gam.rds")
+```
+
+### GAM partial-effect plots
+
+```{r}
+# ============================================================
+# Create a reference patient
+# ============================================================
+
+reference_patient <- gam_full_ready[
+  1,
+  gam_predictors,
+  drop = FALSE
+]
+
+for (nm in gam_predictors) {
+  
+  x <- gam_full_ready[[nm]]
+  
+  if (is.factor(x)) {
+    
+    most_common <- names(
+      which.max(table(x))
+    )
+    
+    reference_patient[[nm]] <- factor(
+      most_common,
+      levels = levels(x)
+    )
+    
+  } else {
+    
+    reference_patient[[nm]] <- median(
+      x,
+      na.rm = TRUE
+    )
+    
+  }
+}
+
+reference_patient
+```
+
+```{r}
+# ============================================================
+# Calculate adjusted odds-ratio curves
+# ============================================================
+
+gam_or_curve <- function(variable) {
+  
+  # Use the central 90% of observed values
+  x_grid <- seq(
+    quantile(
+      gam_full_ready[[variable]],
+      0.05,
+      na.rm = TRUE
+    ),
+    quantile(
+      gam_full_ready[[variable]],
+      0.95,
+      na.rm = TRUE
+    ),
+    length.out = 100
+  )
+  
+  # Repeat reference patient for each grid value
+  new_data <- reference_patient[
+    rep(1, length(x_grid)),
+    ,
+    drop = FALSE
+  ]
+  
+  new_data[[variable]] <- x_grid
+  
+  # Linear predictor matrices
+  X_grid <- predict(
+    gam_full_fit,
+    newdata = new_data,
+    type = "lpmatrix"
+  )
+  
+  X_ref <- predict(
+    gam_full_fit,
+    newdata = reference_patient,
+    type = "lpmatrix"
+  )
+  
+  # Difference relative to the reference value
+  X_diff <- sweep(
+    X_grid,
+    2,
+    as.numeric(X_ref[1, ]),
+    FUN = "-"
+  )
+  
+  # Log odds ratio
+  log_or <- as.numeric(
+    X_diff %*% coef(gam_full_fit)
+  )
+  
+  # Coefficient covariance matrix
+  V <- vcov(
+    gam_full_fit,
+    unconditional = TRUE
+  )
+  
+  # Standard error of the contrast
+  se <- sqrt(
+    pmax(
+      rowSums((X_diff %*% V) * X_diff),
+      0
+    )
+  )
+  
+  tibble(
+    value = x_grid,
+    OR = exp(log_or),
+    lower = exp(log_or - 1.96 * se),
+    upper = exp(log_or + 1.96 * se),
+    reference = as.numeric(
+      reference_patient[[variable]]
+    )
+  )
+}
+```
+
+```{r}
+# ============================================================
+# Plot three GAM partial effects
+# ============================================================
+
+plot_variables <- c(
+  "Age",
+  "HR_max",
+  "Temp_mean"
+)
+
+plot_labels <- c(
+  Age = "Age (years)",
+  HR_max = "Maximum heart rate (beats/min)",
+  Temp_mean = "Mean temperature (°C)"
+)
+
+for (v in plot_variables) {
+  
+  curve_data <- gam_or_curve(v)
+  
+  p <- ggplot(
+    curve_data,
+    aes(x = value, y = OR)
+  ) +
+    
+    geom_ribbon(
+      aes(ymin = lower, ymax = upper),
+      fill = "#4285F4",
+      alpha = 0.20
+    ) +
+    
+    geom_line(
+      color = "#1F4E79",
+      linewidth = 1.1
+    ) +
+    
+    geom_hline(
+      yintercept = 1,
+      linetype = "dashed",
+      color = "gray45"
+    ) +
+    
+    geom_vline(
+      xintercept = curve_data$reference[1],
+      linetype = "dotted",
+      color = "gray50"
+    ) +
+    
+    labs(
+      title = paste("GAM partial effect:", v),
+      subtitle = "Odds ratio relative to the median; 95% pointwise CI",
+      x = plot_labels[[v]],
+      y = "Odds ratio for ICU mortality"
+    ) +
+    
+    theme_minimal(base_size = 12)
+  
+  print(p)
+  
+  ggsave(
+    filename = paste0(
+      "output/cp2_gam_or_",
+      v,
+      ".png"
+    ),
+    plot = p,
+    width = 7,
+    height = 4.8,
+    dpi = 300
+  )
+}
+```
+
+**Figure interpretation.** The age odds-ratio curve increases steadily relative to median age and is approximately linear on the log-odds scale. The maximum-heart-rate curve is relatively flat at lower values and rises at higher values. The mean-temperature curve indicates higher fitted mortality odds at lower temperatures and flattens toward higher temperatures. Shaded regions are 95% **pointwise** confidence intervals, and uncertainty widens at the ends of the observed ranges. These are adjusted associations rather than causal effects.
+
+## 2.6 Model 3: random forest
+
+I use a random forest of 300 trees to capture nonlinearities and interactions without specifying their functional forms. The number of candidate features per split (`mtry`: 10, 25 or 50) and minimum terminal-node size (`min_n`: 5 or 15) are tuned by three-fold log-loss cross-validation within each outer training fold. Missing values are imputed using each training split; predictors do not need standardization for a tree ensemble.
+
+```{r}
+library(tidymodels)
+library(ranger)
+library(dplyr)
+library(tidyr)
+library(knitr)
+
+set.seed(707)
+
+stopifnot(
+  identical(
+    levels(cv_data$death),
+    c("Survived", "Died")
+  )
+)
+```
+
+```{r}
+# ============================================================
+# STEP 2.6A — Random Forest
+# ============================================================
+
+rf_recipe <- recipe(
+  death ~ .,
+  data = cv_data
+) |>
+  update_role(
+    RecordID,
+    new_role = "ID"
+  ) |>
+  step_filter_missing(
+    threshold = 0.98
+  ) |>
+  step_impute_median(
+    all_numeric_predictors()
+  ) |>
+  step_impute_mode(
+    all_nominal_predictors()
+  ) |>
+  step_zv(
+    all_predictors()
+  )
+```
+
+```{r}
+rf_spec <- rand_forest(
+  trees = 300,
+  mtry = tune(),
+  min_n = tune()
+) |>
+  set_engine(
+    "ranger",
+    num.threads = 2,
+    seed = 707
+  ) |>
+  set_mode("classification")
+
+rf_workflow <- workflow() |>
+  add_recipe(rf_recipe) |>
+  add_model(rf_spec)
+
+rf_grid <- tidyr::crossing(
+  mtry = c(10L, 25L, 50L),
+  min_n = c(5L, 15L)
+)
+
+rf_grid
+```
+
+```{r}
+# Store results for all five outer folds
+rf_fold_results <- vector("list", 5)
+rf_fold_predictions <- vector("list", 5)
+
+for (i in seq_along(cv_folds$splits)) {
+  
+  cat("\n====================================\n")
+  cat("Random Forest — Fold", i, "of 5\n")
+  cat("====================================\n")
+  
+  # Outer training and validation sets
+  outer_train <- rsample::analysis(
+    cv_folds$splits[[i]]
+  )
+  
+  outer_valid <- rsample::assessment(
+    cv_folds$splits[[i]]
+  )
+  
+  # Inner CV: training data only
+  set.seed(707 + i)
+  
+  inner_folds <- rsample::vfold_cv(
+    outer_train,
+    v = 3,
+    strata = death
+  )
+  
+  # Tune parameters using inner CV
+  rf_tuned <- tune::tune_grid(
+    rf_workflow,
+    resamples = inner_folds,
+    grid = rf_grid,
+    metrics = yardstick::metric_set(
+      yardstick::mn_log_loss
+    ),
+    control = tune::control_grid(
+      verbose = TRUE
+    )
+  )
+  
+  # Select best hyperparameters
+  best_rf <- tune::select_best(
+    rf_tuned,
+    metric = "mn_log_loss"
+  )
+  
+  # Finalize model for this outer fold
+  final_rf_workflow <- tune::finalize_workflow(
+    rf_workflow,
+    best_rf
+  )
+  
+  # Fit on outer training data only
+  rf_fit <- fit(
+    final_rf_workflow,
+    data = outer_train
+  )
+  
+  # Predict held-out outer validation set
+  rf_prob <- predict(
+    rf_fit,
+    new_data = outer_valid,
+    type = "prob"
+  )
+  
+  rf_pred <- tibble(
+    RecordID = outer_valid$RecordID,
+    Fold = cv_folds$id[[i]],
+    death = outer_valid$death,
+    .pred_Died = rf_prob$.pred_Died
+  )
+  
+  # Evaluation metrics
+  fold_auroc <- yardstick::roc_auc(
+    rf_pred,
+    truth = death,
+    .pred_Died,
+    event_level = "second"
+  )$.estimate
+  
+  fold_brier <- mean(
+    (
+      as.numeric(rf_pred$death == "Died") -
+        rf_pred$.pred_Died
+    )^2
+  )
+  
+  rf_fold_results[[i]] <- tibble(
+    Fold = paste0("Fold", i),
+    N = nrow(outer_valid),
+    Deaths = sum(outer_valid$death == "Died"),
+    Best_mtry = best_rf$mtry,
+    Best_min_n = best_rf$min_n,
+    AUROC = fold_auroc,
+    Brier_score = fold_brier
+  )
+  
+  rf_fold_predictions[[i]] <- rf_pred
+  
+  # Save progress after every fold
+  saveRDS(
+    list(
+      metrics = rf_fold_results,
+      predictions = rf_fold_predictions
+    ),
+    "output/cp2_rf_progress.rds"
+  )
+  
+  print(rf_fold_results[[i]])
+}
+```
+
+```{r}
+rf_cv_results <- dplyr::bind_rows(
+  rf_fold_results
+)
+
+rf_cv_summary <- tibble(
+  Mean_AUROC = mean(rf_cv_results$AUROC),
+  SD_AUROC = sd(rf_cv_results$AUROC),
+  Mean_Brier = mean(rf_cv_results$Brier_score)
+)
+
+knitr::kable(
+  rf_cv_results,
+  digits = 4,
+  caption = "Random Forest performance by fold"
+)
+
+knitr::kable(
+  rf_cv_summary,
+  digits = 4,
+  caption = "Random Forest cross-validation summary"
+)
+```
+
+Random forest achieves a mean outer-fold AUROC of `r sprintf("%.4f", rf_cv_summary$Mean_AUROC)` (SD `r sprintf("%.4f", rf_cv_summary$SD_AUROC)`) and a mean Brier score of `r sprintf("%.4f", rf_cv_summary$Mean_Brier)`. Performance is comparatively stable across the five validation folds. The tuning grid and the selected `mtry` and `min_n` for each fold are reported above.
+
+```{r}
+rf_oof <- dplyr::bind_rows(
+  rf_fold_predictions
+) |>
+  arrange(RecordID)
+
+stopifnot(
+  nrow(rf_oof) == 4000,
+  dplyr::n_distinct(rf_oof$RecordID) == 4000,
+  !anyNA(rf_oof$.pred_Died)
+)
+
+write.csv(
+  rf_oof,
+  "output/cp2_model3_rf_oof.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  rf_cv_results,
+  "output/cp2_model3_rf_cv.csv",
+  row.names = FALSE
+)
+```
+
+### Tune random forest for final refitting
+
+```{r}
+# ============================================================
+# STEP 2.6B — Final Random Forest
+# ============================================================
+
+set.seed(707)
+
+# Tune using all 4,000 records
+rf_full_tuned <- tune::tune_grid(
+  rf_workflow,
+  resamples = cv_folds,
+  grid = rf_grid,
+  metrics = yardstick::metric_set(
+    yardstick::mn_log_loss
+  ),
+  control = tune::control_grid(
+    verbose = TRUE
+  )
+)
+
+# Display leading parameter combinations
+tune::show_best(
+  rf_full_tuned,
+  metric = "mn_log_loss",
+  n = 6
+)
+
+# Select final parameters
+rf_best_final <- tune::select_best(
+  rf_full_tuned,
+  metric = "mn_log_loss"
+)
+
+print(rf_best_final)
+```
+
+### Final random forest fit
+
+```{r}
+rf_final_spec <- rand_forest(
+  trees = 300,
+  mtry = rf_best_final$mtry,
+  min_n = rf_best_final$min_n
+) |>
+  set_engine(
+    "ranger",
+    importance = "permutation",
+    num.threads = 2,
+    seed = 707
+  ) |>
+  set_mode("classification")
+
+rf_final_workflow <- workflow() |>
+  add_recipe(rf_recipe) |>
+  add_model(rf_final_spec)
+
+set.seed(707)
+
+rf_final_fit <- fit(
+  rf_final_workflow,
+  data = cv_data
+)
+
+saveRDS(
+  rf_final_fit,
+  file = "output/cp2_model3_rf.rds"
+)
+
+file.exists("output/cp2_model3_rf.rds")
+```
+
+### Permutation variable importance
+
+```{r}
+rf_engine <- workflows::extract_fit_engine(
+  rf_final_fit
+)
+
+rf_importance <- tibble(
+  Predictor = names(
+    rf_engine$variable.importance
+  ),
+  Importance = as.numeric(
+    rf_engine$variable.importance
+  )
+) |>
+  arrange(desc(Importance))
+
+rf_top20 <- rf_importance |>
+  slice_head(n = 20)
+
+knitr::kable(
+  rf_top20,
+  digits = 4,
+  caption = "Twenty most important Random Forest predictors"
+)
+
+write.csv(
+  rf_importance,
+  "output/cp2_rf_variable_importance.csv",
+  row.names = FALSE
+)
+```
+
+### Random forest importance plot
+
+```{r}
+rf_importance_plot <- rf_top20 |>
+  mutate(
+    Predictor = forcats::fct_reorder(
+      Predictor,
+      Importance
+    )
+  ) |>
+  ggplot(
+    aes(
+      x = Importance,
+      y = Predictor
+    )
+  ) +
+  geom_col(
+    fill = "#2C7FB8"
+  ) +
+  labs(
+    title = "Random Forest Variable Importance",
+    subtitle = "Top 20 predictors (permutation importance)",
+    x = "Permutation importance",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 12)
+
+print(rf_importance_plot)
+
+ggsave(
+  "output/cp2_rf_variable_importance.png",
+  plot = rf_importance_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+**Figure interpretation.** Permutation importance ranks last and mean GCS, mean urine output and several BUN summaries highly. These measurements summarize neurological status, urine output and renal function, respectively. Their permutation importance represents predictive contribution in this fitted forest, and can be shared or unstable across correlated predictors; it does not imply causality.
+
+## 2.7 Comparison and final model selection
+
+For a like-for-like comparison, SAPS-I and SOFA are each used as a **single-score** logistic risk predictor. The score-to-risk logistic calibration and any score imputation are fitted separately within each outer training fold. Thus benchmark Brier scores describe fold-wise calibrated scores, rather than raw ordinal severity scores. Their ROC rankings are compared using the same validation stays and five folds as the three machine learning models.
+
+### 2.7.0 Reproducible SAPS-I and SOFA benchmark predictions
+
+The outcomes file supplies SAPS-I and SOFA scores. Each is evaluated separately, without including the other score or any machine-learning features. Median score imputation and the one-predictor logistic calibration are estimated only on each outer training fold and then applied to the held-out fold. This step **creates** the benchmark OOF CSV rather than relying on a file generated manually in a previous RStudio session.
+
+```{r}
+# 2.7.0: Create benchmark predictions from set-a only
+benchmark_scores <- c("SAPS-I", "SOFA")
+benchmark_results <- vector("list", length(benchmark_scores) * nrow(cv_folds))
+idx <- 0L
+
+for (score_name in benchmark_scores) {
+  for (i in seq_len(nrow(cv_folds))) {
+    split_i <- cv_folds$splits[[i]]
+    train_ids <- rsample::analysis(split_i)$RecordID
+    valid_ids <- rsample::assessment(split_i)$RecordID
+
+    train_b <- tibble(RecordID = train_ids) |>
+      left_join(benchmarks, by = "RecordID")
+    valid_b <- tibble(RecordID = valid_ids) |>
+      left_join(benchmarks, by = "RecordID")
+
+    # The original PhysioNet missing-value code is -1.
+    train_score <- as.numeric(train_b[[score_name]])
+    valid_score <- as.numeric(valid_b[[score_name]])
+    train_score[!is.finite(train_score) | train_score == -1] <- NA_real_
+    valid_score[!is.finite(valid_score) | valid_score == -1] <- NA_real_
+
+    imputation_median <- median(train_score, na.rm = TRUE)
+    stopifnot(is.finite(imputation_median))
+    train_score[is.na(train_score)] <- imputation_median
+    valid_score[is.na(valid_score)] <- imputation_median
+
+    train_calibration <- data.frame(
+      death = as.integer(train_b$death),
+      score = train_score
+    )
+    valid_calibration <- data.frame(score = valid_score)
+
+    calibrated_model <- glm(
+      death ~ score,
+      data = train_calibration,
+      family = binomial(link = "logit")
+    )
+    predicted <- as.numeric(predict(
+      calibrated_model,
+      newdata = valid_calibration,
+      type = "response"
+    ))
+
+    idx <- idx + 1L
+    benchmark_results[[idx]] <- tibble(
+      RecordID = valid_b$RecordID,
+      Fold = cv_folds$id[[i]],
+      death = as.integer(valid_b$death),
+      p_death = predicted,
+      Model = if (score_name == "SAPS-I") "SAPS_I" else "SOFA"
+    )
+  }
+}
+
+benchmark_oof <- bind_rows(benchmark_results)
+stopifnot(
+  nrow(benchmark_oof) == 8000,
+  !anyDuplicated(benchmark_oof[c("RecordID", "Model")]),
+  !anyNA(benchmark_oof$p_death),
+  all(benchmark_oof$p_death >= 0 & benchmark_oof$p_death <= 1)
+)
+write.csv(
+  benchmark_oof,
+  "output/cp2_benchmark_oof.csv",
+  row.names = FALSE
+)
+
+benchmark_fold_summary <- benchmark_oof |>
+  mutate(truth = factor(death, levels = c(0, 1),
+                        labels = c("Survived", "Died"))) |>
+  group_by(Model, Fold) |>
+  summarise(
+    AUROC = yardstick::roc_auc_vec(truth, p_death,
+                                   event_level = "second"),
+    Brier_score = mean((p_death - death)^2),
+    .groups = "drop"
+  )
+knitr::kable(
+  benchmark_fold_summary |>
+    group_by(Model) |>
+    summarise(Mean_AUROC = mean(AUROC), SD_AUROC = sd(AUROC),
+              Mean_Brier = mean(Brier_score), .groups = "drop"),
+  digits = 4,
+  caption = "Clinical score benchmarks (training-fold calibration)"
+)
+```
+
+### 2.7.1 Fold reconstruction and integrity checks
+
+```{r}
+
+# ============================================================
+# 2.7 Model Comparison and Final Model Selection
+# ============================================================
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(yardstick)
+library(rsample)
+library(knitr)
+
+dir.create("output", showWarnings = FALSE)
+
+# Load the original five-fold CV splits
+cv_folds <- readRDS(
+  "output/cp2_folds.rds"
+)
+
+# Reconstruct RecordID-to-Fold mapping
+# Also recover the true outcome for validation
+correct_fold_map <- bind_rows(
+  lapply(seq_len(nrow(cv_folds)), function(i) {
+    
+    valid <- assessment(cv_folds$splits[[i]])
+    
+    tibble(
+      RecordID = as.character(valid$RecordID),
+      Correct_Fold = as.character(cv_folds$id[[i]]),
+      Correct_death = as.integer(
+        as.character(valid$death) %in% c("Died", "1")
+      )
+    )
+  })
+)
+
+# Verify the saved CV splits
+stopifnot(
+  nrow(correct_fold_map) == 4000,
+  n_distinct(correct_fold_map$RecordID) == 4000,
+  !anyNA(correct_fold_map$Correct_Fold),
+  sum(correct_fold_map$Correct_death) == 554
+)
+
+cat("Original five-fold mapping loaded successfully.\n")
+
+```
+
+### 2.7.2 Load standardized OOF predictions
+
+```{r}
+
+# ============================================================
+# Function: Read and standardize OOF predictions
+# ============================================================
+
+read_oof <- function(file, model_name = NULL) {
+  
+  dat <- read.csv(
+    file,
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  )
+  
+  if (!"RecordID" %in% names(dat)) {
+    stop("Missing RecordID in: ", file)
+  }
+  
+  # Identify probability column
+  prob_options <- c(
+    "p_death",
+    ".pred_Died",
+    "predicted_probability",
+    "predicted_prob",
+    "pred_prob",
+    "probability",
+    "prob",
+    "p_hat",
+    "pred_death"
+  )
+  
+  prob_col <- intersect(
+    prob_options,
+    names(dat)
+  )
+  
+  if (length(prob_col) == 0) {
+    stop(
+      "Probability column not found in: ", file,
+      "\nAvailable columns: ",
+      paste(names(dat), collapse = ", ")
+    )
+  }
+  
+  prob_col <- prob_col[1]
+  
+  # Identify outcome column
+  outcome_options <- c(
+    "death",
+    "truth",
+    "In-hospital_death"
+  )
+  
+  outcome_col <- intersect(
+    outcome_options,
+    names(dat)
+  )
+  
+  if (length(outcome_col) == 0) {
+    stop(
+      "Outcome column not found in: ", file,
+      "\nAvailable columns: ",
+      paste(names(dat), collapse = ", ")
+    )
+  }
+  
+  outcome_col <- outcome_col[1]
+  
+  # Standardize outcome to 0/1
+  outcome_values <- as.character(
+    dat[[outcome_col]]
+  )
+  
+  death_numeric <- case_when(
+    outcome_values %in% c("0", "Survived") ~ 0L,
+    outcome_values %in% c("1", "Died") ~ 1L,
+    TRUE ~ NA_integer_
+  )
+  
+  # Standardize model names
+  if (!is.null(model_name)) {
+    
+    model_values <- rep(
+      model_name,
+      nrow(dat)
+    )
+    
+  } else {
+    
+    if (!"Model" %in% names(dat)) {
+      stop("Missing Model column in: ", file)
+    }
+    
+    model_values <- as.character(dat$Model)
+  }
+  
+  model_values <- case_when(
+    model_values %in% c(
+      "SAPS_I", "SAPS-I", "SAPS I"
+    ) ~ "SAPS-I",
+    model_values == "SOFA" ~ "SOFA",
+    TRUE ~ model_values
+  )
+  
+  # Standardize data format
+  result <- tibble(
+    RecordID = as.character(dat$RecordID),
+    death = death_numeric,
+    p_death = as.numeric(dat[[prob_col]]),
+    Model = model_values
+  )
+  
+  # Add original Fold mapping
+  result <- result |>
+    left_join(
+      correct_fold_map,
+      by = "RecordID"
+    )
+  
+  # Check original fold labels if they exist
+  if ("Fold" %in% names(dat)) {
+    
+    existing_fold <- as.character(dat$Fold)
+    
+    inconsistent <- (
+      !is.na(existing_fold) &
+        nzchar(existing_fold) &
+        (
+          is.na(result$Correct_Fold) |
+            existing_fold != result$Correct_Fold
+        )
+    )
+    
+    inconsistent[is.na(inconsistent)] <- TRUE
+    
+    if (any(inconsistent)) {
+      stop(
+        "Saved Fold labels disagree with original CV: ",
+        file
+      )
+    }
+  }
+  
+  # Verify observed outcomes
+  stopifnot(
+    !anyNA(result$death),
+    !anyNA(result$Correct_death),
+    all(result$death == result$Correct_death)
+  )
+  
+  # Use verified original fold labels
+  result <- result |>
+    mutate(
+      Fold = Correct_Fold
+    ) |>
+    select(
+      RecordID,
+      Fold,
+      death,
+      p_death,
+      Model
+    )
+  
+  # Validate predictions
+  stopifnot(
+    nrow(result) == 4000 ||
+      (
+        is.null(model_name) &&
+          nrow(result) == 8000
+      ),
+    !anyNA(result$Fold),
+    !anyNA(result$p_death),
+    all(is.finite(result$p_death)),
+    all(result$p_death >= 0),
+    all(result$p_death <= 1)
+  )
+  
+  return(result)
+}
+```
+
+### 2.7.3 Merge the five prediction methods
+
+```{r}
+
+# ============================================================
+# Read all five prediction methods
+# ============================================================
+
+ridge_pred <- read_oof(
+  "output/cp2_model1_ridge_oof.csv",
+  "Ridge"
+)
+
+gam_pred <- read_oof(
+  "output/cp2_model2_gam_oof.csv",
+  "GAM"
+)
+
+rf_pred <- read_oof(
+  "output/cp2_model3_rf_oof.csv",
+  "Random Forest"
+)
+
+benchmark_pred <- read_oof(
+  "output/cp2_benchmark_oof.csv"
+)
+
+# Combine predictions
+all_oof <- bind_rows(
+  ridge_pred,
+  gam_pred,
+  rf_pred,
+  benchmark_pred
+)
+
+# Define consistent model order
+model_order <- c(
+  "Random Forest",
+  "Ridge",
+  "GAM",
+  "SAPS-I",
+  "SOFA"
+)
+
+all_oof <- all_oof |>
+  mutate(
+    Model = factor(
+      Model,
+      levels = model_order
+    ),
+    truth = factor(
+      death,
+      levels = c(0, 1),
+      labels = c("Survived", "Died")
+    )
+  )
+
+# Check number of predictions
+prediction_counts <- all_oof |>
+  count(Model)
+
+knitr::kable(
+  prediction_counts,
+  caption = "Number of out-of-fold predictions"
+)
+
+# Verify all patients have five predictions
+patient_check <- all_oof |>
+  group_by(RecordID) |>
+  summarise(
+    n_predictions = n(),
+    n_models = n_distinct(Model),
+    n_folds = n_distinct(Fold),
+    n_outcomes = n_distinct(death),
+    .groups = "drop"
+  )
+
+stopifnot(
+  nrow(all_oof) == 20000,
+  nrow(patient_check) == 4000,
+  !anyNA(all_oof$Model),
+  all(patient_check$n_predictions == 5),
+  all(patient_check$n_models == 5),
+  all(patient_check$n_folds == 1),
+  all(patient_check$n_outcomes == 1),
+  all(prediction_counts$n == 4000),
+  all(prediction_counts$Model == factor(
+    model_order,
+    levels = model_order
+  ))
+)
+
+cat(
+  "SUCCESS: All five models have 4000 aligned predictions.\n"
+)
+```
+
+### 2.7.4 Fold-level AUROC and Brier scores
+
+```{r}
+
+# ============================================================
+# Calculate fold-level model performance
+# ============================================================
+
+fold_performance <- all_oof |>
+  group_by(Model, Fold) |>
+  summarise(
+    N = n(),
+    
+    Deaths = sum(death == 1),
+    
+    AUROC = yardstick::roc_auc_vec(
+      truth = truth,
+      estimate = p_death,
+      event_level = "second"
+    ),
+    
+    Brier_score = mean(
+      (p_death - death)^2
+    ),
+    
+    .groups = "drop"
+  )
+
+knitr::kable(
+  fold_performance,
+  digits = 4,
+  caption = "Performance of all five methods across CV folds"
+)
+
+# Save fold-level results
+write.csv(
+  fold_performance,
+  "output/cp2_all_fold_performance.csv",
+  row.names = FALSE
+)
+```
+
+### 2.7.5 Performance comparison
+
+```{r}
+
+# ============================================================
+# Overall model comparison
+# ============================================================
+
+# Average performance across five folds
+comparison_table <- fold_performance |>
+  group_by(Model) |>
+  summarise(
+    Mean_AUROC = mean(AUROC),
+    SD_AUROC = sd(AUROC),
+    Mean_Brier = mean(Brier_score),
+    .groups = "drop"
+  )
+
+# Calculate pooled out-of-fold AUROC
+pooled_auc <- all_oof |>
+  group_by(Model) |>
+  summarise(
+    Pooled_AUROC = yardstick::roc_auc_vec(
+      truth = truth,
+      estimate = p_death,
+      event_level = "second"
+    ),
+    .groups = "drop"
+  )
+
+# Combine metrics
+comparison_table <- comparison_table |>
+  left_join(
+    pooled_auc,
+    by = "Model"
+  ) |>
+  arrange(desc(Mean_AUROC))
+
+# Print final table
+knitr::kable(
+  comparison_table,
+  digits = 4,
+  caption = "Final comparison of mortality prediction methods"
+)
+
+# Save table
+write.csv(
+  comparison_table,
+  "output/cp2_model_comparison.csv",
+  row.names = FALSE
+)
+
+# Save standardized OOF predictions
+write.csv(
+  all_oof,
+  "output/cp2_oof_predictions.csv",
+  row.names = FALSE
+)
+```
+
+Among these five methods, random forest has the highest mean AUROC (`r sprintf("%.4f", comparison_table$Mean_AUROC[comparison_table$Model == "Random Forest"])`) and lowest mean Brier score (`r sprintf("%.4f", comparison_table$Mean_Brier[comparison_table$Model == "Random Forest"])`). Ridge and GAM are very close (mean AUROC differences below 0.01), whereas both SAPS-I and SOFA are much lower than the machine learning models. The improvements against the benchmark scores are much larger than the typical observed fold-to-fold AUROC variation; however, five folds do not provide a formal significance test of the model differences.
+
+### 2.7.6 ROC curves
+
+```{r}
+
+# ============================================================
+# 2.7.6 Improved ROC plot
+# ============================================================
+
+library(ggplot2)
+library(dplyr)
+library(yardstick)
+
+# ROC coordinates from out-of-fold predictions
+roc_data <- all_oof |>
+  group_by(Model) |>
+  roc_curve(
+    truth = truth,
+    p_death,
+    event_level = "second"
+  ) |>
+  ungroup()
+
+# Legend labels
+auc_labels <- comparison_table |>
+  mutate(
+    Legend = paste0(
+      as.character(Model),
+      " (AUC = ",
+      sprintf("%.3f", Pooled_AUROC),
+      ")"
+    )
+  )
+
+label_map <- setNames(
+  auc_labels$Legend,
+  as.character(auc_labels$Model)
+)
+
+roc_data <- roc_data |>
+  mutate(
+    Model_label = factor(
+      label_map[as.character(Model)],
+      levels = unname(label_map[model_order])
+    )
+  )
+
+# Improved plot
+roc_plot <- ggplot(
+  roc_data,
+  aes(
+    x = 1 - specificity,
+    y = sensitivity,
+    color = Model_label,
+    group = Model_label
+  )
+) +
+  geom_path(linewidth = 1.05) +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    linetype = "dashed",
+    color = "gray65"
+  ) +
+  scale_x_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.2)
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.2)
+  ) +
+  labs(
+    title = "ROC Curves for ICU Mortality Prediction",
+    subtitle = "Five-fold out-of-fold predictions (n = 4,000)",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = "Model"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      size = 15
+    ),
+    plot.subtitle = element_text(size = 11),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 10),
+    plot.margin = margin(15, 20, 15, 20)
+  ) +
+  guides(
+    color = guide_legend(ncol = 2)
+  )
+
+# Display
+print(roc_plot)
+
+# Save publication-style figure
+ggsave(
+  "output/cp2_roc_all_models.png",
+  plot = roc_plot,
+  width = 10,
+  height = 7,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
+
+```
+
+**Figure interpretation.** The three fitted machine-learning models have very similar ROC curves and clearly outperform the two clinical-score benchmarks over much of the false-positive-rate range. The figure legend reports *pooled* OOF AUROCs, while the comparison table reports the primary mean and SD of five held-out fold AUROCs. The two summaries need not be numerically identical.
+
+### 2.7.7 Final model selection
+
+```{r}
+
+# ============================================================
+# Final model selection
+# ============================================================
+
+best_model_name <- comparison_table |>
+  arrange(desc(Mean_AUROC)) |>
+  slice(1) |>
+  pull(Model) |>
+  as.character()
+
+cat("Selected final model:", best_model_name, "\n")
+
+# Confirm the selected model
+stopifnot(
+  best_model_name == "Random Forest"
+)
+
+# Save the already refitted RF workflow if it exists
+if (exists("rf_final_fit", inherits = TRUE)) {
+  
+  saveRDS(
+    rf_final_fit,
+    "output/cp2_final_model.rds"
+  )
+  
+  cat("Final Random Forest model saved.\n")
+  
+} else if (file.exists(
+  "output/cp2_model3_rf.rds"
+)) {
+  
+  file.copy(
+    "output/cp2_model3_rf.rds",
+    "output/cp2_final_model.rds",
+    overwrite = TRUE
+  )
+  
+  cat("Saved RF model copied to final model file.\n")
+  
+} else {
+  stop("Final RF model not found: check Section 2.6 outputs")
+}
+```
+
+### 2.7.8 Output verification
+
+```{r}
+
+# ============================================================
+# Final output validation
+# ============================================================
+
+required_files <- c(
+  "output/cp2_all_fold_performance.csv",
+  "output/cp2_model_comparison.csv",
+  "output/cp2_oof_predictions.csv",
+  "output/cp2_roc_all_models.png",
+  "output/cp2_final_model.rds"
+)
+
+output_check <- tibble(
+  File = required_files,
+  Exists = file.exists(required_files)
+)
+
+knitr::kable(
+  output_check,
+  caption = "Checkpoint 2 final output verification"
+)
+
+if (all(output_check$Exists)) {
+  
+  cat(
+    "\nSUCCESS: All required Section 2.7 files exist.\n"
+  )
+  
+} else {
+  
+  cat(
+    "\nSome files are missing. ",
+    "Check the output table above.\n"
+  )
+}
+```
+
+### Conclusion and limitations
+
+Random forest is selected because it has the best mean held-out AUROC and mean Brier score across the compared methods, while retaining a reasonably small variation across folds. The advantage over ridge and GAM is modest and does not establish statistical superiority. Ridge is simpler and its standardized coefficients are more directly interpretable; GAM helps visualize nonlinearity. The benchmark scores have substantially worse discrimination in this particular dataset. All estimates are internal to set-a. They do not establish clinical utility or generalization to another hospital, population or period. Follow-up work should evaluate calibration, decision curves and subgroups, which are deferred to Checkpoint 3.
+
+### Reproducibility and outputs
+
+Only relative paths are used. All results come from the set-a patient files and `Outcomes-a.txt`; random seeds and common CV folds are defined above. The fitted preprocessing and final random forest are saved as `output/cp2_final_model.rds`, alongside `output/cp2_oof_predictions.csv`, figure files and the fold-level model comparison. Generate this report from a fresh repository checkout using `pixi run --locked checkpoint2` once the environment and data are in place. The command should produce `output/checkpoint2.html`.
